@@ -49,8 +49,8 @@ struct props {
 	uint32_t max_latency;
 };
 
-#define FILL_FRAMES 3
-#define MAX_FRAME_COUNT 256
+#define FILL_FRAMES 2
+#define MAX_FRAME_COUNT 32
 #define MAX_BUFFERS 32
 
 struct buffer {
@@ -162,15 +162,19 @@ struct impl {
 	uint16_t seqnum;
 	uint32_t timestamp;
 
-	bool in_pull;
+	int min_bitpool;
+	int max_bitpool;
 
-	int64_t last_time;
+	uint64_t last_time;
+	uint64_t last_error;
+	uint64_t written_frames;
+
+	bool in_pull;
 
 	struct timespec now;
 	int64_t start_time;
 	int64_t sample_count;
 	int64_t sample_time;
-	int64_t sample_queued;
 	int64_t written_count;
 	int64_t filled;
 	int64_t last_ticks;
@@ -773,14 +777,13 @@ static inline void calc_timeout(size_t target, size_t current,
 static int reset_buffer(struct impl *this)
 {
 	this->buffer_used = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
-	this->sample_queued = 0;
 	this->frame_count = 0;
 	return 0;
 }
 
-static int send_buffer(struct impl *this, uint64_t now_time)
+static int send_buffer(struct impl *this)
 {
-	int err, val, written;
+	int val, written;
 	struct rtp_header *header;
 	struct rtp_payload *payload;
 
@@ -795,20 +798,17 @@ static int send_buffer(struct impl *this, uint64_t now_time)
 	header->timestamp = htonl(this->timestamp);
 	header->ssrc = htonl(1);
 
-	err = ioctl(this->transport->fd, TIOCOUTQ, &val);
+	ioctl(this->transport->fd, TIOCOUTQ, &val);
 
-	spa_log_trace(this->log, "a2dp-sink %p: send %d %u %u %u %lu %lu %d %ld",
+	spa_log_trace(this->log, "a2dp-sink %p: send %d %u %u %u %lu %d",
 			this, this->frame_count, this->seqnum, this->timestamp, this->buffer_used,
-			this->sample_queued, this->sample_time, val, now_time);
+			this->sample_time, val);
 
 	written = write(this->transport->fd, this->buffer, this->buffer_used);
-	spa_log_debug(this->log, "a2dp-sink %p: send %d %ld %ld",
-			this, written, now_time, now_time - this->last_time);
-	this->last_time = now_time;
+	spa_log_trace(this->log, "a2dp-sink %p: send %d", this, written);
 	if (written < 0)
 		return -errno;
 
-	this->sample_time += this->sample_queued;
 	this->timestamp = this->sample_count;
 	this->seqnum++;
 	reset_buffer(this);
@@ -835,7 +835,7 @@ static int encode_buffer(struct impl *this, const void *data, int size)
 		return processed;
 
 	this->sample_count += processed / this->frame_size;
-	this->sample_queued += processed / this->frame_size;
+	this->sample_time += processed / this->frame_size;
 	this->frame_count += processed / this->codesize;
 	this->buffer_used += out_encoded;
 
@@ -851,13 +851,13 @@ static bool need_flush(struct impl *this)
 		this->frame_count > MAX_FRAME_COUNT;
 }
 
-static int flush_buffer(struct impl *this, bool force, uint64_t now_time)
+static int flush_buffer(struct impl *this, bool force)
 {
 	spa_log_trace(this->log, "%d %d %d", this->buffer_used, this->frame_length,
 			this->write_size);
 
 	if (force || need_flush(this))
-		return send_buffer(this, now_time);
+		return send_buffer(this);
 
 	return 0;
 }
@@ -874,14 +874,12 @@ static int fill_socket(struct impl *this, uint64_t now_time)
 		if (processed == 0)
 			break;
 
-		written = flush_buffer(this, false, now_time);
+		written = flush_buffer(this, false);
 		if (written == -EAGAIN)
 			break;
 		else if (written < 0)
 			return written;
 		else if (written > 0) {
-			if (frames == 0)
-				this->start_time = now_time;
 			frames++;
 		}
 	}
@@ -910,29 +908,12 @@ static int add_data(struct impl *this, const void *data, int size)
 	return total;
 }
 
-#if 0
-static int flush_data(struct impl *this)
-{
-	int written;
-
-	written = flush_buffer(this, false);
-	if (written < 0) {
-		spa_log_trace(this->log, "write %s", spa_strerror(written));
-		if (written == -EAGAIN) {
-			this->flush_source.mask = SPA_IO_IN | SPA_IO_OUT;
-			spa_loop_update_source(this->data_loop, &this->flush_source);
-		}
-	}
-	return written;
-}
-#endif
-
 static int set_bitpool(struct impl *this, int bitpool)
 {
-	if (bitpool < 16)
-		bitpool = 16;
-	if (bitpool > 51)
-		bitpool = 51;
+	if (bitpool < this->min_bitpool)
+		bitpool = this->min_bitpool;
+	if (bitpool > this->max_bitpool)
+		bitpool = this->max_bitpool;
 
 	this->sbc.bitpool = bitpool;
 
@@ -952,7 +933,7 @@ static int set_bitpool(struct impl *this, int bitpool)
 
 static int reduce_bitpool(struct impl *this)
 {
-	return set_bitpool(this, this->sbc.bitpool - 1);
+	return set_bitpool(this, this->sbc.bitpool - 5);
 }
 
 static int increase_bitpool(struct impl *this)
@@ -960,113 +941,18 @@ static int increase_bitpool(struct impl *this)
 	return set_bitpool(this, this->sbc.bitpool + 1);
 }
 
-#if 0
-static void a2dp_on_flush(struct spa_source *source)
+static int flush_data(struct impl *this)
 {
-	struct impl *this = source->data;
+	uint32_t total_frames, written;
+	uint64_t exp, now_time, elapsed;
+	int64_t queued;
 	struct itimerspec ts;
-	int written;
-
-	clock_gettime(CLOCK_MONOTONIC, &this->now);
-
-	if ((source->rmask & SPA_IO_OUT) == 0) {
-		spa_log_warn(this->log, "error %d", source->rmask);
-		this->flush_source.mask = 0;
-		spa_loop_update_source(this->data_loop, &this->flush_source);
-		this->source.mask = 0;
-		spa_loop_update_source(this->data_loop, &this->source);
-		return;
-	}
-
-	spa_log_trace(this->log, "flushing");
-
-	written = flush_buffer(this, false);
-	if (written < 0) {
-		spa_log_trace(this->log, "error flushing %s", spa_strerror(written));
-		//reset_buffer(this);
-		//increase_bitpool(this);
-		//reduce_bitpool(this);
-		//this->sample_time += this->write_samples;
-
-		calc_timeout(this->write_samples,
-			     0,
-			     this->current_format.info.raw.rate,
-			     &this->now, &ts.it_value);
-		ts.it_interval.tv_sec = 0;
-		ts.it_interval.tv_nsec = 0;
-		timerfd_settime(this->timerfd, TFD_TIMER_ABSTIME, &ts, NULL);
-	}
-
-//	else {
-		this->flush_source.mask = 0;
-		spa_loop_update_source(this->data_loop, &this->flush_source);
-		this->source.mask = SPA_IO_IN;
-		spa_loop_update_source(this->data_loop, &this->source);
-//	}
-}
-#endif
-
-static int process_data(struct impl *this, bool flush)
-{
-	int err;
-	uint32_t total_frames = 0, written;
-	uint64_t elapsed, now_time;
-	struct itimerspec ts;
-
 
 	clock_gettime(CLOCK_MONOTONIC, &this->now);
 	now_time = this->now.tv_sec * SPA_NSEC_PER_SEC + this->now.tv_nsec;
 
-	if (this->start_time == 0) {
-		if ((err = fill_socket(this, now_time)) < 0)
-			spa_log_error(this->log, "error fill socket %s", spa_strerror(err));
-	}
-
-	if (this->start_time > 0 && now_time > this->start_time)
-		elapsed = now_time - this->start_time;
-	else
-		elapsed = 0;
-
-	elapsed = elapsed * this->current_format.info.raw.rate / SPA_NSEC_PER_SEC;
-
-	this->filled = this->sample_count - elapsed;
-	if (this->filled < 0) {
-//		elapsed = this->sample_count;
-//		this->start_time = now_time - (elapsed * SPA_NSEC_PER_SEC / this->current_format.info.raw.rate);
-	}
-#if 0
-	if (this->filled < 0) {
-//		this->sample_time = elapsed + this->write_samples;
-//		reduce_bitpool(this);
-	}
-	else if (this->filled > FILL_FRAMES * this->write_samples) {
-		spa_log_trace(this->log, "delay processing %ld > %d", this->filled,
-				FILL_FRAMES * this->write_samples);
-		this->flush_source.mask = 0;
-		spa_loop_update_source(this->data_loop, &this->flush_source);
-
-		calc_timeout(this->filled,
-			     FILL_FRAMES * this->write_samples,
-			     this->current_format.info.raw.rate,
-			     &this->now, &ts.it_value);
-		ts.it_interval.tv_sec = 0;
-		ts.it_interval.tv_nsec = 0;
-		timerfd_settime(this->timerfd, TFD_TIMER_ABSTIME, &ts, NULL);
-
-		this->source.mask = SPA_IO_IN;
-		spa_loop_update_source(this->data_loop, &this->source);
-		return 0;
-	}
-#endif
-
-	spa_log_trace(this->log, "timeout %ld %ld %ld %ld %ld %ld %ld", this->filled,
-		      this->sample_time, elapsed, this->start_time, now_time, this->now.tv_sec, this->now.tv_nsec);
-
-	spa_log_trace(this->log, "%ld", now_time);
-
-	try_pull(this, this->write_samples, true);
-
       again:
+	total_frames = 0;
 	while (!spa_list_is_empty(&this->ready)) {
 		uint8_t *src;
 		int n_bytes, n_frames;
@@ -1112,90 +998,67 @@ static int process_data(struct impl *this, bool flush)
 		spa_log_trace(this->log, "a2dp-sink %p: written %u frames", this, total_frames);
 	}
 
-	if (need_flush(this)) {
-		if (this->timestamp <= elapsed) {
-			written = send_buffer(this, now_time);
-			if (written == -EAGAIN) {
-				this->timestamp += 2 * this->write_samples;
-				this->start_time += (this->write_samples * SPA_NSEC_PER_SEC / this->current_format.info.raw.rate);
-//				elapsed = this->timestamp - this->write_samples;
-//				this->start_time = now_time - (elapsed * SPA_NSEC_PER_SEC / this->current_format.info.raw.rate);
-			}
-		}
-		calc_timeout(this->timestamp,
-			     elapsed,
-			     this->current_format.info.raw.rate,
-			     &this->now, &ts.it_value);
-		ts.it_interval.tv_sec = 0;
-		ts.it_interval.tv_nsec = 0;
-		timerfd_settime(this->timerfd, TFD_TIMER_ABSTIME, &ts, NULL);
-
-		this->source.mask = SPA_IO_IN;
-		spa_loop_update_source(this->data_loop, &this->source);
-		return 0;
-	}
-
-#if 0
-	written = flush_buffer(this, false, now_time);
+	written = flush_buffer(this, false);
 	if (written == -EAGAIN) {
-		//this->sample_time += this->filled + FILL_FRAMES * this->write_samples;
-
-		if (false && (this->flush_source.mask & SPA_IO_OUT) == 0) {
-			spa_log_trace(this->log, "delay flush %ld", this->sample_time);
+		spa_log_trace(this->log, "delay flush %ld", this->sample_time);
+		if ((this->flush_source.mask & SPA_IO_OUT) == 0) {
 			this->flush_source.mask = SPA_IO_OUT;
 			spa_loop_update_source(this->data_loop, &this->flush_source);
 			this->source.mask = 0;
 			spa_loop_update_source(this->data_loop, &this->source);
-			//this->sample_time += this->filled + this->write_samples;
-			//increase_bitpool(this);
+			this->sample_time += this->write_samples;
+			if (now_time - this->last_error > SPA_NSEC_PER_SEC / 2) {
+				reduce_bitpool(this);
+				this->last_error = now_time;
+			}
+			return 0;
 		}
-		else {
-			spa_log_trace(this->log, "time flush");
-			this->flush_source.mask = 0;
-			spa_loop_update_source(this->data_loop, &this->flush_source);
-
-			calc_timeout(this->timestamp - elapsed,
-				     this->write_samples,
-				     this->current_format.info.raw.rate,
-				     &this->now, &ts.it_value);
-			ts.it_interval.tv_sec = 0;
-			ts.it_interval.tv_nsec = 0;
-			timerfd_settime(this->timerfd, TFD_TIMER_ABSTIME, &ts, NULL);
-
-			this->source.mask = SPA_IO_IN;
-			spa_loop_update_source(this->data_loop, &this->source);
-		}
-		return 0;
+		goto wait;
 	}
 	else if (written < 0) {
 		spa_log_trace(this->log, "error flushing %s", spa_strerror(written));
 		return written;
 	}
-#endif
+	else if (written > 0) {
+		if (now_time - this->last_error > SPA_NSEC_PER_SEC * 5) {
+			increase_bitpool(this);
+			this->last_error = now_time;
+		}
+	}
 
 	if (!spa_list_is_empty(&this->ready))
 		goto again;
 
+      wait:
 	this->flush_source.mask = 0;
 	spa_loop_update_source(this->data_loop, &this->flush_source);
 
-	return 0;
-}
+	if (now_time > this->start_time)
+		elapsed = now_time - this->start_time;
+	else
+		elapsed = 0;
 
-static void a2dp_on_timeout(struct spa_source *source)
-{
-	struct impl *this = source->data;
-	uint64_t exp;
+	elapsed = elapsed * this->current_format.info.raw.rate / SPA_NSEC_PER_SEC;
 
-	spa_log_trace(this->log, "timeout");
+	queued = this->sample_time - elapsed;
+	spa_log_trace(this->log, "queued %ld %ld %ld %d",
+			now_time, queued, this->sample_time, this->write_samples);
 
-	if (read(this->timerfd, &exp, sizeof(uint64_t)) != sizeof(uint64_t))
-		spa_log_warn(this->log, "error reading timerfd: %s", strerror(errno));
+	if (queued < 0)
+		queued = 0;
 
-	this->source.mask = 0;
+	calc_timeout(queued,
+		     FILL_FRAMES * this->write_samples,
+		     this->current_format.info.raw.rate,
+		     &this->now, &ts.it_value);
+	ts.it_interval.tv_sec = 0;
+	ts.it_interval.tv_nsec = 0;
+	timerfd_settime(this->timerfd, TFD_TIMER_ABSTIME, &ts, NULL);
+
+	this->source.mask = SPA_IO_IN;
 	spa_loop_update_source(this->data_loop, &this->source);
 
-	process_data(this, false);
+	return 0;
 }
 
 static void a2dp_on_flush(struct spa_source *source)
@@ -1208,19 +1071,18 @@ static void a2dp_on_flush(struct spa_source *source)
 		spa_log_warn(this->log, "error %d", source->rmask);
 		this->flush_source.mask = 0;
 		spa_loop_update_source(this->data_loop, &this->flush_source);
+		this->source.mask = 0;
+		spa_loop_update_source(this->data_loop, &this->source);
 		return;
 	}
-	process_data(this, true);
+	flush_data(this);
 }
 
-#if 0
 static void a2dp_on_timeout(struct spa_source *source)
 {
 	struct impl *this = source->data;
 	int err;
-	uint64_t exp, elapsed, now_time, threshold;
-	uint32_t frames, total_frames, to_write;
-	bool underrun = false;
+	uint64_t exp, now_time;
 	struct itimerspec ts;
 
 	if (this->started && read(this->timerfd, &exp, sizeof(uint64_t)) != sizeof(uint64_t))
@@ -1229,119 +1091,19 @@ static void a2dp_on_timeout(struct spa_source *source)
 	clock_gettime(CLOCK_MONOTONIC, &this->now);
 	now_time = this->now.tv_sec * SPA_NSEC_PER_SEC + this->now.tv_nsec;
 
-	if (!this->started) {
-		if ((err = fill_socket(this)) < 0)
-			spa_log_error(this->log, "error fill socket %s", spa_strerror(err));
+	spa_log_trace(this->log, "timeout %ld %ld", now_time, now_time - this->last_time);
+	this->last_time = now_time;
 
+	try_pull(this, this->write_samples, true);
+
+	if (this->start_time == 0) {
+		if ((err = fill_socket(this, now_time)) < 0)
+			spa_log_error(this->log, "error fill socket %s", spa_strerror(err));
 		this->start_time = now_time;
 	}
 
-	if (this->start_time > 0 && now_time > this->start_time)
-		elapsed = now_time - this->start_time;
-	else
-		elapsed = 0;
-
-	elapsed = elapsed * this->current_format.info.raw.rate / SPA_NSEC_PER_SEC;
-
-	if (this->sample_time > 0 && this->sample_time > elapsed)
-		this->filled = this->sample_time - elapsed;
-	else {
-		this->filled = 0;
-//		this->sample_time = elapsed;
-		reduce_bitpool(this);
-	}
-
-	spa_log_trace(this->log, "timeout %ld %d %ld %ld %ld %ld %ld %ld", this->filled, this->threshold,
-		      this->sample_time, elapsed, this->start_time, now_time, this->now.tv_sec, this->now.tv_nsec);
-
-	frames = this->props.max_latency;
-	to_write = SPA_MIN(frames, this->props.max_latency);
-	total_frames = 0;
-
-	try_pull(this, frames, true);
-
-	while (!spa_list_is_empty(&this->ready) && to_write > 0) {
-		uint8_t *src;
-		int err, n_bytes, n_frames;
-		struct buffer *b;
-		struct spa_data *d;
-		uint32_t index, offs, avail, l0, l1;
-
-		b = spa_list_first(&this->ready, struct buffer, link);
-		d = b->outbuf->datas;
-
-		src = d[0].data;
-
-		index = d[0].chunk->offset + this->ready_offset;
-		avail = d[0].chunk->size - this->ready_offset;
-		avail /= this->frame_size;
-
-		offs = index % d[0].maxsize;
-		n_frames = SPA_MIN(avail, to_write);
-		n_bytes = n_frames * this->frame_size;
-
-		l0 = SPA_MIN(n_bytes, d[0].maxsize - offs);
-		l1 = n_bytes - l0;
-
-		n_bytes = add_data(this, src + offs, l0);
-		if (n_bytes <= 0)
-			break;
-
-		n_frames = n_bytes / this->frame_size;
-
-		this->ready_offset += n_bytes;
-
-		if (this->ready_offset >= d[0].chunk->size) {
-			spa_list_remove(&b->link);
-			b->outstanding = true;
-			spa_log_trace(this->log, "a2dp-sink %p: reuse buffer %u", this, b->outbuf->id);
-			this->callbacks->reuse_buffer(this->callbacks_data, 0, b->outbuf->id);
-			this->ready_offset = 0;
-		}
-		total_frames += n_frames;
-		to_write -= n_frames;
-
-		spa_log_trace(this->log, "a2dp-sink %p: written %u frames, left %u",
-				this, total_frames, to_write);
-	}
 	flush_data(this);
-
-	try_pull(this, frames, total_frames, true);
-
-	if (total_frames == 0) {
-		//total_frames = SPA_MIN(frames, this->threshold);
-		this->underrun += total_frames;
-		underrun = true;
-	}
-
-	if (this->underrun > 0) {
-		if (this->underrun >= this->current_format.info.raw.rate || !underrun) {
-			spa_log_warn(this->log, "underrun, for %zd frames", this->underrun);
-			this->underrun = 0;
-		}
-	}
-
-	if (this->sample_time + this->sample_queued > elapsed)
-		this->filled = this->sample_time - elapsed + this->sample_queued;
-	else
-		this->filled = 0;
-
-	if (this->filled > 2 * this->write_samples)
-		threshold = 2 * this->write_samples;
-	else
-		threshold = 0;
-
-	spa_log_trace(this->log, "%ld %ld", this->filled, threshold);
-
-	calc_timeout(this->filled,
-		     2 * this->write_samples,
-		     this->current_format.info.raw.rate,
-		     &this->now, &ts.it_value);
-	ts.it_interval.tv_sec = 0;
-	ts.it_interval.tv_nsec = 0;
-	timerfd_settime(this->timerfd, TFD_TIMER_ABSTIME, &ts, NULL);
 }
-#endif
 
 static int init_sbc(struct impl *this)
 {
@@ -1406,6 +1168,9 @@ static int init_sbc(struct impl *this)
 		return -EINVAL;
 	}
 
+	this->min_bitpool = SPA_MAX(conf->min_bitpool, 12);
+	this->max_bitpool = conf->max_bitpool;
+
 	set_bitpool(this, conf->max_bitpool);
 
 	this->seqnum = 0;
@@ -1432,7 +1197,7 @@ static int do_start(struct impl *this)
 
 	init_sbc(this);
 
-	val = 3 * this->transport->write_mtu;
+	val = FILL_FRAMES * this->transport->write_mtu;
 	if (setsockopt(this->transport->fd, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val)) < 0)
 		spa_log_warn(this->log, "a2dp-sink %p: SO_SNDBUF %m", this);
 
@@ -1464,9 +1229,11 @@ static int do_start(struct impl *this)
 	this->flush_source.data = this;
 	this->flush_source.fd = this->transport->fd;
 	this->flush_source.func = a2dp_on_flush;
-	this->flush_source.mask = SPA_IO_IN | SPA_IO_OUT;
+	this->flush_source.mask = SPA_IO_OUT;
 	this->flush_source.rmask = 0;
 	spa_loop_add_source(this->data_loop, &this->flush_source);
+
+	this->source.func(&this->source);
 
 	this->started = true;
 
@@ -1539,8 +1306,7 @@ static int impl_node_process_input(struct spa_node *node)
 		input->buffer_id = SPA_ID_INVALID;
 		input->status = SPA_STATUS_OK;
 
-		if (!this->in_pull)
-			process_data(this, false);
+		this->written_frames += b->outbuf->datas[0].chunk->size / this->frame_size;
 	}
 	return SPA_STATUS_OK;
 }
