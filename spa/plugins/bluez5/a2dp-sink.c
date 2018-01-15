@@ -167,7 +167,6 @@ struct impl {
 
 	uint64_t last_time;
 	uint64_t last_error;
-	uint64_t written_frames;
 
 	bool in_pull;
 
@@ -915,6 +914,9 @@ static int set_bitpool(struct impl *this, int bitpool)
 	if (bitpool > this->max_bitpool)
 		bitpool = this->max_bitpool;
 
+	if (this->sbc.bitpool == bitpool)
+		return 0;
+
 	this->sbc.bitpool = bitpool;
 
 	spa_log_debug(this->log, "set bitpool %d", this->sbc.bitpool);
@@ -1305,8 +1307,6 @@ static int impl_node_process_input(struct spa_node *node)
 		b->outstanding = false;
 		input->buffer_id = SPA_ID_INVALID;
 		input->status = SPA_STATUS_OK;
-
-		this->written_frames += b->outbuf->datas[0].chunk->size / this->frame_size;
 	}
 	return SPA_STATUS_OK;
 }
